@@ -310,3 +310,59 @@ def analyze_chapter_for_character(
         on_result({})
 
     threading.Thread(target=_run, daemon=True).start()
+
+
+def analyze_selection_for_character(
+    selected_text: str,
+    character_name: str,
+    current_description: str,
+    on_result: Callable[[dict], None],
+) -> None:
+    """
+    Async: analyze a user-selected excerpt for one specific character.
+
+    Returns either {} when the selection does not support an update, or:
+    {
+        "Character Name": {
+            "description_addition": "...",
+            "dialogue": ["...", ...]
+        }
+    }
+    """
+    if not selected_text.strip() or not character_name.strip():
+        on_result({})
+        return
+
+    system = (
+        "You are a silent writing assistant helping maintain a character sheet. "
+        "Analyze only the selected excerpt for one specific character. "
+        "If the selection does not clearly support an update for that character, return {}. "
+        "Otherwise, reply ONLY with a JSON object using exactly this shape: "
+        '{"Character Name":{"description_addition":"new facts only","dialogue":["verbatim dialogue only"]}}. '
+        "Use the exact provided character name as the key. "
+        "Do not invent facts not supported by the selected text. "
+        "Keep description_addition concise and include only genuinely new details. "
+        "No explanation. No markdown. JSON only."
+    )
+    prompt = (
+        f"Character name: {character_name}\n"
+        f"Current description: {current_description or '(none yet)'}\n\n"
+        f"Selected excerpt:\n{selected_text.strip()}"
+    )
+
+    def _run():
+        raw = _call_ollama(system, prompt, max_tokens=220)
+        if raw.startswith("__error__"):
+            on_result({})
+            return
+        raw = _extract_json_snippet(raw)
+        try:
+            result = json.loads(raw)
+            if isinstance(result, dict):
+                on_result(result)
+                return
+        except (json.JSONDecodeError, ValueError):
+            pass
+        on_result({})
+
+    threading.Thread(target=_run, daemon=True).start()

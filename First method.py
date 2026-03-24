@@ -7,6 +7,7 @@ from formatting_utils import apply_body_formatting
 from io_utils import (
     ensure_docx_available,
     ensure_pdf_available,
+    load_docx_project,
     load_docx_chapters,
     load_pdf_text,
     save_docx,
@@ -15,8 +16,7 @@ from io_utils import (
 from ai_utils import (
     fetch_word_suggestions,
     fetch_spell_correction,
-    analyze_paragraph_for_characters,
-    analyze_chapter_for_character,
+    analyze_selection_for_character,
     get_last_ai_error,
     OLLAMA_MODEL,
     OLLAMA_HOST,
@@ -41,6 +41,7 @@ class WritersDesk:
         self.master.geometry("1100x700")
         self.master.minsize(900, 600)
         self.master.configure(bg="#f5f6fa")
+        self.current_save_path: str | None = None
 
         self.chapters: dict[str, str] = {"Chapter 1": ""}
         self.current_chapter = "Chapter 1"
@@ -56,8 +57,6 @@ class WritersDesk:
         self.ai_char_sheet = tk.BooleanVar(value=False)
         self._ai_debounce_id: str | None = None        # after() id for word-choice debounce
         self._ai_last_paragraph: str = ""              # track paragraph changes for char-sheet
-        self._ai_character_scan_id: str | None = None
-        self._ai_character_scan_target: str = ""
 
         self.spell_enabled = tk.BooleanVar(value=False)
         self.suggest_enabled = tk.BooleanVar(value=False)
@@ -70,7 +69,41 @@ class WritersDesk:
         self._build_menubar()
         self._build_layout()
         self._build_tags()
+        self.master.bind_all("<Control-s>", self._save_shortcut)
+        self.master.bind_all("<Control-S>", self._save_as_shortcut)
         self._refresh_word_count()
+
+    def _save_shortcut(self, event=None) -> str:
+        self.save_file()
+        return "break"
+
+    def _save_as_shortcut(self, event=None) -> str:
+        self.save_file_as()
+        return "break"
+
+    def _clear_character_editor(self) -> None:
+        self.char_name_entry.delete(0, tk.END)
+        self.char_desc_entry.delete("1.0", tk.END)
+        self.dialogue_list.delete(0, tk.END)
+
+    def _load_project_data(
+        self,
+        chapters: dict[str, str],
+        characters: dict[str, str] | None = None,
+        character_dialogues: dict[str, list[str]] | None = None,
+    ) -> None:
+        self.chapters = chapters or {"Chapter 1": ""}
+        self.characters = dict(characters or {})
+        self.character_dialogues = {
+            name: list(lines)
+            for name, lines in (character_dialogues or {}).items()
+        }
+        for name in self.characters:
+            self.character_dialogues.setdefault(name, [])
+        self._refresh_character_list()
+        self._clear_character_editor()
+        self.current_chapter = next(iter(self.chapters))
+        self._load_chapter(self.current_chapter)
 
     def _setup_style(self) -> None:
         style = ttk.Style()
@@ -91,7 +124,8 @@ class WritersDesk:
         file_menu = tk.Menu(menubar, tearoff=0)
         menubar.add_cascade(label="File", menu=file_menu)
         file_menu.add_command(label="Open...", command=self.open_file)
-        file_menu.add_command(label="Save As...", command=self.save_file)
+        file_menu.add_command(label="Save", command=self.save_file, accelerator="Ctrl+S")
+        file_menu.add_command(label="Save As...", command=self.save_file_as, accelerator="Ctrl+Shift+S")
         file_menu.add_separator()
         file_menu.add_command(label="Exit", command=self.master.destroy)
 
@@ -209,8 +243,7 @@ class WritersDesk:
         )
 
     def _on_ai_char_sheet_toggle(self) -> None:
-        if self.ai_char_sheet.get():
-            self._schedule_character_sheet_update(delay_ms=200)
+        return
 
     def _build_layout(self) -> None:
         self.master.columnconfigure(0, weight=1)
@@ -299,8 +332,12 @@ class WritersDesk:
         self.text_area.bind("<KeyRelease>", self._refresh_word_count)
         self.text_area.bind("<<Modified>>", self._on_text_modified)
         self.text_area.bind("<KeyRelease>", self._on_key_release, add=True)
-        self.text_area.bind("<Return>", self._on_paragraph_end, add=True)
+        self.text_area.bind("<Button-3>", self._show_editor_context_menu, add=True)
         self._apply_body_formatting()
+
+        self.editor_menu = tk.Menu(self.master, tearoff=0)
+        self.editor_menu.add_command(label="Update Selected Character From Selection", command=self._update_character_from_selection)
+        self.editor_menu.add_command(label="Capture Selection As Dialogue", command=self.add_dialogue_to_character)
 
         text_scroll = ttk.Scrollbar(editor_frame, command=self.text_area.yview)
         self.text_area.config(yscrollcommand=text_scroll.set)
@@ -468,7 +505,6 @@ class WritersDesk:
         self._refresh_chapter_list()
         self._apply_body_formatting()
         self._run_checks()
-        self._schedule_character_sheet_update(delay_ms=500)
 
     def open_file(self) -> None:
         file_path = filedialog.askopenfilename(filetypes=[("Word documents", "*.docx"), ("PDF files", "*.pdf"), ("Text files", "*.txt"), ("All files", "*.*")])
@@ -481,13 +517,12 @@ class WritersDesk:
                 python_cmd = sys.executable or "python"
                 messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
                 return
-            chapters = load_docx_chapters(file_path)
+            chapters, characters, character_dialogues = load_docx_project(file_path)
             if not chapters:
                 messagebox.showinfo("No chapters found", "No Heading 1 sections found in the document.")
                 return
-            self.chapters = chapters
-            self.current_chapter = next(iter(self.chapters))
-            self._load_chapter(self.current_chapter)
+            self._load_project_data(chapters, characters, character_dialogues)
+            self.current_save_path = file_path
             self.master.title(f"Writer's Desk - {file_path}")
         elif file_path.lower().endswith(".pdf"):
             try:
@@ -498,20 +533,33 @@ class WritersDesk:
                 return
             text = load_pdf_text(file_path)
             chapters = split_text_by_headings(text, default_title="Imported PDF")
-            self.chapters = chapters
-            self.current_chapter = next(iter(self.chapters))
-            self._load_chapter(self.current_chapter)
+            self._load_project_data(chapters)
+            self.current_save_path = None
             self.master.title(f"Writer's Desk - {file_path}")
         else:
             with open(file_path, "r", encoding="utf-8") as f:
                 content = f.read()
             chapters = split_text_by_headings(content)
-            self.chapters = chapters
-            self.current_chapter = next(iter(self.chapters))
-            self._load_chapter(self.current_chapter)
+            self._load_project_data(chapters)
+            self.current_save_path = None
             self.master.title(f"Writer's Desk - {file_path}")
 
     def save_file(self) -> None:
+        self._stash_current_chapter()
+        file_path = self.current_save_path
+        if not file_path:
+            self.save_file_as()
+            return
+        try:
+            ensure_docx_available()
+        except ImportError:
+            python_cmd = sys.executable or "python"
+            messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
+            return
+        save_docx(file_path, self.chapters, self.characters, self.character_dialogues)
+        self.master.title(f"Writer's Desk - {file_path}")
+
+    def save_file_as(self) -> None:
         self._stash_current_chapter()
         file_path = filedialog.asksaveasfilename(defaultextension=".docx", filetypes=[("Word documents", "*.docx")])
         if not file_path:
@@ -523,6 +571,7 @@ class WritersDesk:
             messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
             return
         save_docx(file_path, self.chapters, self.characters, self.character_dialogues)
+        self.current_save_path = file_path
         self.master.title(f"Writer's Desk - {file_path}")
 
     def _refresh_word_count(self, event=None) -> None:
@@ -741,7 +790,6 @@ class WritersDesk:
         self._stash_current_chapter()
         self._apply_body_formatting()
         self._run_checks()
-        self._schedule_character_sheet_update(delay_ms=1200)
 
     # ------------------------------------------------------------------
     # AI helpers
@@ -809,54 +857,11 @@ class WritersDesk:
             # Pass debounce_delay=0 — debouncing is handled above by Tk's after()
             fetch_word_suggestions(word, context, _on_suggestions, debounce_delay=0)
 
-    def _on_paragraph_end(self, event=None) -> None:
-        """Keep the Enter hook, but update from the open chapter instead of one paragraph."""
-        self._schedule_character_sheet_update(delay_ms=300)
-
     def _selected_character_name(self) -> str:
         selection = self.char_list.curselection()
         if not selection:
             return ""
         return self.char_list.get(selection[0]).strip()
-
-    def _schedule_character_sheet_update(self, delay_ms: int = 800) -> None:
-        if not self.ai_char_sheet.get():
-            return
-        character_name = self._selected_character_name()
-        if not character_name:
-            return
-        if self._ai_character_scan_id:
-            self.master.after_cancel(self._ai_character_scan_id)
-        self._ai_character_scan_target = character_name
-        self._ai_character_scan_id = self.master.after(delay_ms, self._trigger_character_sheet_update)
-
-    def _trigger_character_sheet_update(self) -> None:
-        self._ai_character_scan_id = None
-        if not self.ai_char_sheet.get():
-            return
-        character_name = self._ai_character_scan_target or self._selected_character_name()
-        if not character_name:
-            return
-        chapter_text = self.text_area.get("1.0", "end-1c").strip()
-        if not chapter_text:
-            return
-        current_description = self.characters.get(character_name, "")
-
-        def _on_char_result(updates: dict):
-            def _apply():
-                self._apply_character_updates(updates)
-                if not updates:
-                    last_error = get_last_ai_error().strip()
-                    if last_error:
-                        self.master.title(f"Writer's Desk - AI error: {last_error}")
-            self.master.after(0, _apply)
-
-        analyze_chapter_for_character(
-            chapter_text,
-            character_name,
-            current_description,
-            _on_char_result,
-        )
 
     def _apply_character_updates(self, updates: dict) -> None:
         """Silently merge AI-inferred character data into character sheets."""
@@ -922,6 +927,63 @@ class WritersDesk:
         self._refresh_character_dialogues(name)
         self._run_checks()
 
+    def _show_editor_context_menu(self, event) -> str:
+        try:
+            has_selection = bool(self.text_area.tag_ranges("sel"))
+        except tk.TclError:
+            has_selection = False
+        has_character = bool(self._selected_character_name())
+        self.editor_menu.entryconfig(
+            "Update Selected Character From Selection",
+            state=tk.NORMAL if self.ai_char_sheet.get() and has_selection and has_character else tk.DISABLED,
+        )
+        self.editor_menu.entryconfig(
+            "Capture Selection As Dialogue",
+            state=tk.NORMAL if has_selection and has_character else tk.DISABLED,
+        )
+        self.editor_menu.tk_popup(event.x_root, event.y_root)
+        self.editor_menu.grab_release()
+        return "break"
+
+    def _update_character_from_selection(self) -> None:
+        if not self.ai_char_sheet.get():
+            messagebox.showinfo("AI disabled", "Enable 'AI: Auto-update character sheets' first.")
+            return
+        character_name = self._selected_character_name()
+        if not character_name:
+            messagebox.showinfo("Select character", "Choose a character in the character sheet first.")
+            return
+        try:
+            selected_text = self.text_area.get("sel.first", "sel.last").strip()
+        except tk.TclError:
+            messagebox.showinfo("Select text", "Highlight text in the editor first.")
+            return
+        if not selected_text:
+            messagebox.showinfo("Select text", "Highlight text in the editor first.")
+            return
+
+        self.master.config(cursor="watch")
+        current_description = self.characters.get(character_name, "")
+
+        def _on_char_result(updates: dict):
+            def _apply():
+                self.master.config(cursor="")
+                self._apply_character_updates(updates)
+                if not updates:
+                    last_error = get_last_ai_error().strip()
+                    if last_error:
+                        messagebox.showerror("AI error", last_error)
+                    else:
+                        messagebox.showinfo("No update", "No character update was found in the selected text.")
+            self.master.after(0, _apply)
+
+        analyze_selection_for_character(
+            selected_text,
+            character_name,
+            current_description,
+            _on_char_result,
+        )
+
     def _refresh_character_list(self, select: str | None = None) -> None:
         self.char_list.delete(0, tk.END)
         for name in sorted(self.characters):
@@ -943,7 +1005,6 @@ class WritersDesk:
         self.char_name_entry.delete(0, tk.END)
         self.char_name_entry.insert(0, name)
         self._refresh_character_dialogues(name)
-        self._schedule_character_sheet_update(delay_ms=300)
 
     def _refresh_character_dialogues(self, name: str) -> None:
         self.dialogue_list.delete(0, tk.END)
