@@ -1,26 +1,12 @@
 import re
-import sys
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
+from ai_controller import AIControllerMixin
+from chapter_controller import ChapterControllerMixin
+from character_controller import CharacterControllerMixin
+from file_controller import FileControllerMixin
 from formatting_utils import apply_body_formatting
-from io_utils import (
-    ensure_docx_available,
-    ensure_pdf_available,
-    load_docx_project,
-    load_docx_chapters,
-    load_pdf_text,
-    save_docx,
-    split_text_by_headings,
-)
-from ai_utils import (
-    fetch_word_suggestions,
-    fetch_spell_correction,
-    analyze_selection_for_character,
-    get_last_ai_error,
-    OLLAMA_MODEL,
-    OLLAMA_HOST,
-)
 
 # Optional deps for type checkers; app guards at runtime
 try:
@@ -34,7 +20,12 @@ except ImportError:
     language_tool_python = None
 
 
-class WritersDesk:
+class WritersDesk(
+    FileControllerMixin,
+    ChapterControllerMixin,
+    CharacterControllerMixin,
+    AIControllerMixin,
+):
     def __init__(self, master: tk.Tk) -> None:
         self.master = master
         self.master.title("Writer's Desk")
@@ -57,6 +48,9 @@ class WritersDesk:
         self.ai_char_sheet = tk.BooleanVar(value=False)
         self._ai_debounce_id: str | None = None        # after() id for word-choice debounce
         self._ai_last_paragraph: str = ""              # track paragraph changes for char-sheet
+        self._word_count_after_id: str | None = None
+        self._format_after_id: str | None = None
+        self._checks_after_id: str | None = None
 
         self.spell_enabled = tk.BooleanVar(value=False)
         self.suggest_enabled = tk.BooleanVar(value=False)
@@ -80,30 +74,6 @@ class WritersDesk:
     def _save_as_shortcut(self, event=None) -> str:
         self.save_file_as()
         return "break"
-
-    def _clear_character_editor(self) -> None:
-        self.char_name_entry.delete(0, tk.END)
-        self.char_desc_entry.delete("1.0", tk.END)
-        self.dialogue_list.delete(0, tk.END)
-
-    def _load_project_data(
-        self,
-        chapters: dict[str, str],
-        characters: dict[str, str] | None = None,
-        character_dialogues: dict[str, list[str]] | None = None,
-    ) -> None:
-        self.chapters = chapters or {"Chapter 1": ""}
-        self.characters = dict(characters or {})
-        self.character_dialogues = {
-            name: list(lines)
-            for name, lines in (character_dialogues or {}).items()
-        }
-        for name in self.characters:
-            self.character_dialogues.setdefault(name, [])
-        self._refresh_character_list()
-        self._clear_character_editor()
-        self.current_chapter = next(iter(self.chapters))
-        self._load_chapter(self.current_chapter)
 
     def _setup_style(self) -> None:
         style = ttk.Style()
@@ -176,74 +146,6 @@ class WritersDesk:
             command=self._on_ai_char_sheet_toggle,
         )
 
-    def _set_ollama_settings(self) -> None:
-        """Let the user change the Ollama model and host at runtime."""
-        import ai_utils
-
-        win = tk.Toplevel(self.master)
-        win.title("Ollama Settings")
-        win.geometry("420x160")
-        win.resizable(False, False)
-        win.grab_set()
-
-        ttk.Label(win, text="Model (e.g. llama3, mistral, phi3):").pack(padx=20, pady=(18, 4), anchor="w")
-        model_var = tk.StringVar(value=ai_utils.OLLAMA_MODEL)
-        ttk.Entry(win, textvariable=model_var, width=40).pack(padx=20, fill="x")
-
-        ttk.Label(win, text="Host:").pack(padx=20, pady=(10, 4), anchor="w")
-        host_var = tk.StringVar(value=ai_utils.OLLAMA_HOST)
-        ttk.Entry(win, textvariable=host_var, width=40).pack(padx=20, fill="x")
-
-        def _save():
-            ai_utils.OLLAMA_MODEL = model_var.get().strip() or ai_utils.OLLAMA_MODEL
-            ai_utils.OLLAMA_HOST  = host_var.get().strip()  or ai_utils.OLLAMA_HOST
-            win.destroy()
-
-        btn_frame = ttk.Frame(win)
-        btn_frame.pack(pady=12)
-        ttk.Button(btn_frame, text="Save", command=_save).pack(side="left", padx=6)
-        ttk.Button(btn_frame, text="Cancel", command=win.destroy).pack(side="left")
-
-    def _check_ai_connection(self) -> None:
-        """Run a lightweight AI request and report whether Ollama is reachable."""
-        self.master.config(cursor="watch")
-
-        def _done(title: str, message: str, error: bool = False) -> None:
-            self.master.config(cursor="")
-            if error:
-                messagebox.showerror(title, message)
-            else:
-                messagebox.showinfo(title, message)
-
-        def _on_suggestions(suggestions):
-            last_error = get_last_ai_error().strip()
-            if last_error:
-                self.master.after(
-                    0,
-                    lambda: _done(
-                        "Ollama Connection Failed",
-                        f"Host: {OLLAMA_HOST}\nModel: {OLLAMA_MODEL}\n\nError:\n{last_error}",
-                        error=True,
-                    ),
-                )
-                return
-            self.master.after(
-                0,
-                lambda: _done(
-                    "Ollama Connected",
-                    f"Host: {OLLAMA_HOST}\nModel: {OLLAMA_MODEL}\n\nTest suggestions: {', '.join(suggestions) if suggestions else '(connected, but no suggestions returned)'}",
-                ),
-            )
-
-        fetch_word_suggestions(
-            "walked",
-            "She walked into the room and looked around carefully.",
-            _on_suggestions,
-            debounce_delay=0,
-        )
-
-    def _on_ai_char_sheet_toggle(self) -> None:
-        return
 
     def _build_layout(self) -> None:
         self.master.columnconfigure(0, weight=1)
@@ -396,183 +298,6 @@ class WritersDesk:
         self.text_area.tag_configure("misspelled", underline=True, foreground="#c0392b")
         self.text_area.tag_configure("grammar", underline=True, foreground="#d68910")
 
-    def _refresh_chapter_list(self) -> None:
-        self.chapter_list.delete(0, tk.END)
-        for name in self.chapters:
-            self.chapter_list.insert(tk.END, name)
-        current_index = list(self.chapters.keys()).index(self.current_chapter)
-        self.chapter_list.selection_set(current_index)
-        self.chapter_list.activate(current_index)
-
-    def add_chapter(self) -> None:
-        name = self.new_chapter_entry.get().strip() or self._next_chapter_name()
-        if name in self.chapters:
-            messagebox.showinfo("Exists", "Chapter already exists.")
-            return
-        self._stash_current_chapter()
-        self.chapters[name] = ""
-        self.current_chapter = name
-        self._refresh_chapter_list()
-        self._load_chapter(name)
-        self.new_chapter_entry.delete(0, tk.END)
-        self._run_checks()
-
-    def add_next_chapter(self) -> None:
-        name = self._next_chapter_name()
-        if name in self.chapters:
-            suffix = 1
-            while f"{name} ({suffix})" in self.chapters:
-                suffix += 1
-            name = f"{name} ({suffix})"
-        self._stash_current_chapter()
-        self.chapters[name] = ""
-        self.current_chapter = name
-        self._refresh_chapter_list()
-        self._load_chapter(name)
-        self._run_checks()
-
-    def merge_with_previous(self) -> None:
-        selection = self.chapter_list.curselection()
-        if not selection or selection[0] == 0:
-            messagebox.showinfo("Cannot merge", "Select a chapter that has a previous section.")
-            return
-        current_name = self.chapter_list.get(selection[0])
-        prev_name = self.chapter_list.get(selection[0] - 1)
-        self._stash_current_chapter()
-        merged = (self.chapters.get(prev_name, "") + "\n\n" + self.chapters.get(current_name, "")).strip("\n")
-        self.chapters[prev_name] = merged
-        del self.chapters[current_name]
-        self.current_chapter = prev_name
-        self._refresh_chapter_list()
-        self._load_chapter(prev_name)
-
-    def rename_chapter(self) -> None:
-        selection = self.chapter_list.curselection()
-        if not selection:
-            messagebox.showinfo("Select chapter", "Pick a chapter to rename.")
-            return
-        old_name = self.chapter_list.get(selection[0])
-        new_name = self.new_chapter_entry.get().strip()
-        if not new_name:
-            messagebox.showinfo("Name needed", "Enter a new name in the input field.")
-            return
-        if new_name in self.chapters and new_name != old_name:
-            messagebox.showinfo("Exists", "A chapter with that name already exists.")
-            return
-        self._stash_current_chapter()
-        self.chapters[new_name] = self.chapters.pop(old_name)
-        if self.current_chapter == old_name:
-            self.current_chapter = new_name
-        self._refresh_chapter_list()
-        self._load_chapter(self.current_chapter)
-        self.new_chapter_entry.delete(0, tk.END)
-
-    def delete_chapter(self) -> None:
-        selection = self.chapter_list.curselection()
-        if not selection:
-            messagebox.showinfo("Select chapter", "Pick a chapter to delete.")
-            return
-        if len(self.chapters) == 1:
-            messagebox.showinfo("Cannot delete", "At least one chapter is required.")
-            return
-        name = self.chapter_list.get(selection[0])
-        del self.chapters[name]
-        remaining_keys = list(self.chapters.keys())
-        new_index = min(selection[0], len(remaining_keys) - 1)
-        self.current_chapter = remaining_keys[new_index]
-        self._load_chapter(self.current_chapter)
-        self._refresh_chapter_list()
-
-    def _on_chapter_select(self, event=None) -> None:
-        selection = self.chapter_list.curselection()
-        if not selection:
-            return
-        new_chapter = self.chapter_list.get(selection[0])
-        if new_chapter == self.current_chapter:
-            return
-        self._stash_current_chapter()
-        self._load_chapter(new_chapter)
-
-    def _stash_current_chapter(self) -> None:
-        self.chapters[self.current_chapter] = self.text_area.get("1.0", "end-1c")
-
-    def _load_chapter(self, name: str) -> None:
-        self.current_chapter = name
-        self.text_area.delete("1.0", tk.END)
-        self.text_area.insert("1.0", self.chapters.get(name, ""))
-        self.text_area.edit_reset()
-        self._refresh_word_count()
-        self._refresh_chapter_list()
-        self._apply_body_formatting()
-        self._run_checks()
-
-    def open_file(self) -> None:
-        file_path = filedialog.askopenfilename(filetypes=[("Word documents", "*.docx"), ("PDF files", "*.pdf"), ("Text files", "*.txt"), ("All files", "*.*")])
-        if not file_path:
-            return
-        if file_path.lower().endswith(".docx"):
-            try:
-                ensure_docx_available()
-            except ImportError:
-                python_cmd = sys.executable or "python"
-                messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
-                return
-            chapters, characters, character_dialogues = load_docx_project(file_path)
-            if not chapters:
-                messagebox.showinfo("No chapters found", "No Heading 1 sections found in the document.")
-                return
-            self._load_project_data(chapters, characters, character_dialogues)
-            self.current_save_path = file_path
-            self.master.title(f"Writer's Desk - {file_path}")
-        elif file_path.lower().endswith(".pdf"):
-            try:
-                ensure_pdf_available()
-            except ImportError:
-                python_cmd = sys.executable or "python"
-                messagebox.showerror("Missing dependency", f"Install PyPDF2:\n{python_cmd} -m pip install PyPDF2")
-                return
-            text = load_pdf_text(file_path)
-            chapters = split_text_by_headings(text, default_title="Imported PDF")
-            self._load_project_data(chapters)
-            self.current_save_path = None
-            self.master.title(f"Writer's Desk - {file_path}")
-        else:
-            with open(file_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            chapters = split_text_by_headings(content)
-            self._load_project_data(chapters)
-            self.current_save_path = None
-            self.master.title(f"Writer's Desk - {file_path}")
-
-    def save_file(self) -> None:
-        self._stash_current_chapter()
-        file_path = self.current_save_path
-        if not file_path:
-            self.save_file_as()
-            return
-        try:
-            ensure_docx_available()
-        except ImportError:
-            python_cmd = sys.executable or "python"
-            messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
-            return
-        save_docx(file_path, self.chapters, self.characters, self.character_dialogues)
-        self.master.title(f"Writer's Desk - {file_path}")
-
-    def save_file_as(self) -> None:
-        self._stash_current_chapter()
-        file_path = filedialog.asksaveasfilename(defaultextension=".docx", filetypes=[("Word documents", "*.docx")])
-        if not file_path:
-            return
-        try:
-            ensure_docx_available()
-        except ImportError:
-            python_cmd = sys.executable or "python"
-            messagebox.showerror("Missing dependency", f"Install python-docx:\n{python_cmd} -m pip install python-docx")
-            return
-        save_docx(file_path, self.chapters, self.characters, self.character_dialogues)
-        self.current_save_path = file_path
-        self.master.title(f"Writer's Desk - {file_path}")
 
     def _refresh_word_count(self, event=None) -> None:
         text = self.text_area.get("1.0", "end-1c")
@@ -784,272 +509,39 @@ class WritersDesk:
     def _apply_body_formatting(self) -> None:
         self._normalizing = apply_body_formatting(self.text_area, self._normalizing)
 
+    def _schedule_word_count_refresh(self, delay_ms: int = 250) -> None:
+        if self._word_count_after_id:
+            self.master.after_cancel(self._word_count_after_id)
+        self._word_count_after_id = self.master.after(delay_ms, self._run_scheduled_word_count_refresh)
+
+    def _run_scheduled_word_count_refresh(self) -> None:
+        self._word_count_after_id = None
+        self._refresh_word_count()
+
+    def _schedule_body_formatting(self, delay_ms: int = 500) -> None:
+        if self._format_after_id:
+            self.master.after_cancel(self._format_after_id)
+        self._format_after_id = self.master.after(delay_ms, self._run_scheduled_body_formatting)
+
+    def _run_scheduled_body_formatting(self) -> None:
+        self._format_after_id = None
+        self._apply_body_formatting()
+
+    def _schedule_checks(self, delay_ms: int = 900) -> None:
+        if self._checks_after_id:
+            self.master.after_cancel(self._checks_after_id)
+        self._checks_after_id = self.master.after(delay_ms, self._run_scheduled_checks)
+
+    def _run_scheduled_checks(self) -> None:
+        self._checks_after_id = None
+        self._run_checks()
+
     def _on_text_modified(self, event=None) -> None:
         self.text_area.edit_modified(0)
-        self._refresh_word_count()
-        self._stash_current_chapter()
-        self._apply_body_formatting()
-        self._run_checks()
+        self._schedule_word_count_refresh()
+        self._schedule_body_formatting()
+        self._schedule_checks()
 
-    # ------------------------------------------------------------------
-    # AI helpers
-    # ------------------------------------------------------------------
-
-    def _get_cursor_word_and_context(self) -> tuple[str, str]:
-        """Return (word_at_cursor, surrounding_sentence) or ("", "")."""
-        try:
-            cursor = self.text_area.index(tk.INSERT)
-            line_text = self.text_area.get(f"{cursor} linestart", f"{cursor} lineend")
-            col = int(cursor.split(".")[1])
-            left = col
-            while left > 0 and (line_text[left - 1].isalnum() or line_text[left - 1] in "'"):
-                left -= 1
-            right = col
-            while right < len(line_text) and (line_text[right].isalnum() or line_text[right] in "'"):
-                right += 1
-            word = line_text[left:right]
-            return word, line_text.strip()
-        except Exception:
-            return "", ""
-
-    def _on_key_release(self, event=None) -> None:
-        """
-        Debounce AI word-choice suggestions using Tk's after() scheduler.
-        Fires 400 ms after the user stops typing. The debounce in ai_utils
-        is disabled (delay=0) to avoid double-stacking delays.
-        """
-        if not self.ai_word_choice.get() and not self.ai_spell.get():
-            return
-        if self._ai_debounce_id:
-            self.master.after_cancel(self._ai_debounce_id)
-        self._ai_debounce_id = self.master.after(400, self._trigger_ai_word_check)
-
-    def _trigger_ai_word_check(self) -> None:
-        self._ai_debounce_id = None
-        word, context = self._get_cursor_word_and_context()
-        if not word or len(word) < 2 or not any(ch.isalpha() for ch in word):
-            return
-
-        is_likely_misspelled = False
-        if self.spell_checker:
-            is_likely_misspelled = bool(self.spell_checker.unknown([word]))
-
-        if self.ai_spell.get() and is_likely_misspelled:
-            def _on_spell(corrections):
-                def _apply():
-                    self._update_suggestions(corrections)
-                    if not corrections:
-                        last_error = get_last_ai_error().strip()
-                        if last_error:
-                            self.master.title(f"Writer's Desk - AI error: {last_error}")
-                self.master.after(0, _apply)
-            fetch_spell_correction(word, context, _on_spell)
-
-        elif self.ai_word_choice.get():
-            def _on_suggestions(suggestions):
-                def _apply():
-                    self._update_suggestions(suggestions)
-                    if not suggestions:
-                        last_error = get_last_ai_error().strip()
-                        if last_error:
-                            self.master.title(f"Writer's Desk - AI error: {last_error}")
-                self.master.after(0, _apply)
-            # Pass debounce_delay=0 — debouncing is handled above by Tk's after()
-            fetch_word_suggestions(word, context, _on_suggestions, debounce_delay=0)
-
-    def _selected_character_name(self) -> str:
-        selection = self.char_list.curselection()
-        if not selection:
-            return ""
-        return self.char_list.get(selection[0]).strip()
-
-    def _apply_character_updates(self, updates: dict) -> None:
-        """Silently merge AI-inferred character data into character sheets."""
-        if not updates:
-            return
-        changed = False
-        for name, data in updates.items():
-            if not isinstance(data, dict):
-                continue
-            desc_addition = data.get("description_addition", "").strip()
-            dialogues = data.get("dialogue", [])
-
-            if name not in self.characters:
-                self.characters[name] = desc_addition
-                self.character_dialogues.setdefault(name, [])
-                changed = True
-            else:
-                if desc_addition:
-                    existing = self.characters[name]
-                    if desc_addition not in existing:
-                        self.characters[name] = (existing + "\n" + desc_addition).strip()
-                        changed = True
-
-            for line in dialogues:
-                line = line.strip()
-                if line and line not in self.character_dialogues.get(name, []):
-                    self.character_dialogues.setdefault(name, []).append(line)
-                    changed = True
-
-        if changed:
-            current_selection = self.char_list.curselection()
-            selected_name = self.char_list.get(current_selection[0]) if current_selection else None
-            self._refresh_character_list(select=selected_name)
-
-    def add_or_update_character(self) -> None:
-        name = self.char_name_entry.get().strip()
-        if not name:
-            messagebox.showinfo("Name needed", "Enter a character name.")
-            return
-        desc = self.char_desc_entry.get("1.0", "end-1c").strip()
-        self.characters[name] = desc
-        self.character_dialogues.setdefault(name, [])
-        self._refresh_character_list(select=name)
-        self.char_desc_entry.delete("1.0", tk.END)
-        self.char_name_entry.delete(0, tk.END)
-
-    def add_dialogue_to_character(self) -> None:
-        try:
-            text = self.text_area.get("sel.first", "sel.last")
-        except tk.TclError:
-            messagebox.showinfo("Select text", "Highlight dialogue in the editor first.")
-            return
-        selection = self.char_list.curselection()
-        if not selection:
-            messagebox.showinfo("Select character", "Choose a character to attach this dialogue.")
-            return
-        name = self.char_list.get(selection[0])
-        cleaned = text.strip()
-        if not cleaned:
-            return
-        self.character_dialogues.setdefault(name, [])
-        self.character_dialogues[name].append(cleaned)
-        self._refresh_character_dialogues(name)
-        self._run_checks()
-
-    def _show_editor_context_menu(self, event) -> str:
-        try:
-            has_selection = bool(self.text_area.tag_ranges("sel"))
-        except tk.TclError:
-            has_selection = False
-        has_character = bool(self._selected_character_name())
-        self.editor_menu.entryconfig(
-            "Update Selected Character From Selection",
-            state=tk.NORMAL if self.ai_char_sheet.get() and has_selection and has_character else tk.DISABLED,
-        )
-        self.editor_menu.entryconfig(
-            "Capture Selection As Dialogue",
-            state=tk.NORMAL if has_selection and has_character else tk.DISABLED,
-        )
-        self.editor_menu.tk_popup(event.x_root, event.y_root)
-        self.editor_menu.grab_release()
-        return "break"
-
-    def _update_character_from_selection(self) -> None:
-        if not self.ai_char_sheet.get():
-            messagebox.showinfo("AI disabled", "Enable 'AI: Auto-update character sheets' first.")
-            return
-        character_name = self._selected_character_name()
-        if not character_name:
-            messagebox.showinfo("Select character", "Choose a character in the character sheet first.")
-            return
-        try:
-            selected_text = self.text_area.get("sel.first", "sel.last").strip()
-        except tk.TclError:
-            messagebox.showinfo("Select text", "Highlight text in the editor first.")
-            return
-        if not selected_text:
-            messagebox.showinfo("Select text", "Highlight text in the editor first.")
-            return
-
-        self.master.config(cursor="watch")
-        current_description = self.characters.get(character_name, "")
-
-        def _on_char_result(updates: dict):
-            def _apply():
-                self.master.config(cursor="")
-                self._apply_character_updates(updates)
-                if not updates:
-                    last_error = get_last_ai_error().strip()
-                    if last_error:
-                        messagebox.showerror("AI error", last_error)
-                    else:
-                        messagebox.showinfo("No update", "No character update was found in the selected text.")
-            self.master.after(0, _apply)
-
-        analyze_selection_for_character(
-            selected_text,
-            character_name,
-            current_description,
-            _on_char_result,
-        )
-
-    def _refresh_character_list(self, select: str | None = None) -> None:
-        self.char_list.delete(0, tk.END)
-        for name in sorted(self.characters):
-            self.char_list.insert(tk.END, name)
-        if select and select in self.characters:
-            index = sorted(self.characters).index(select)
-            self.char_list.selection_set(index)
-            self.char_list.activate(index)
-            self._on_character_select()
-
-    def _on_character_select(self, event=None) -> None:
-        selection = self.char_list.curselection()
-        if not selection:
-            return
-        name = self.char_list.get(selection[0])
-        desc = self.characters.get(name, "")
-        self.char_desc_entry.delete("1.0", tk.END)
-        self.char_desc_entry.insert("1.0", desc)
-        self.char_name_entry.delete(0, tk.END)
-        self.char_name_entry.insert(0, name)
-        self._refresh_character_dialogues(name)
-
-    def _refresh_character_dialogues(self, name: str) -> None:
-        self.dialogue_list.delete(0, tk.END)
-        dialogues = self.character_dialogues.get(name, [])
-        for idx, line in enumerate(dialogues, 1):
-            display = line.replace("\n", " ")
-            if len(display) > 60:
-                display = display[:57] + "..."
-            self.dialogue_list.insert(tk.END, f"{idx}. {display}")
-
-    def _auto_capture_dialogue_for_selected_character(self, text: str) -> None:
-        selection = self.char_list.curselection()
-        if not selection:
-            return
-        name = self.char_list.get(selection[0])
-        cleaned = text.strip()
-        if not cleaned:
-            return
-        self.character_dialogues.setdefault(name, [])
-        if cleaned not in self.character_dialogues[name]:
-            self.character_dialogues[name].append(cleaned)
-        self._refresh_character_dialogues(name)
-
-    def _toggle_char_sheet(self) -> None:
-        if self.show_char_sheet.get():
-            if self.char_frame not in self.panes.panes():
-                self.panes.add(self.char_frame, weight=1)
-        else:
-            try:
-                self.panes.forget(self.char_frame)
-            except tk.TclError:
-                pass
-
-    def _next_chapter_name(self) -> str:
-        max_num = 0
-        pattern = re.compile(r"^chapter\s+(\d+)$", re.IGNORECASE)
-        for name in self.chapters.keys():
-            m = pattern.match(name.strip())
-            if m:
-                try:
-                    num = int(m.group(1))
-                    max_num = max(max_num, num)
-                except ValueError:
-                    continue
-        return f"Chapter {max_num + 1}" if max_num >= 1 else f"Chapter {len(self.chapters) + 1}"
 
 
 if __name__ == "__main__":
